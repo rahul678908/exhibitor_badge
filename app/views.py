@@ -12,6 +12,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.db import transaction
 from .pagination import RegistrationPagination
 from django.core.cache import cache
+import io
+ 
+from django.shortcuts import get_object_or_404
+from rest_framework.parsers import MultiPartParser, FormParser
+from .tasks import process_bulk_upload, commit_bulk_upload
 
 
 import pandas as pd
@@ -20,7 +25,6 @@ import pandas as pd
 
 from django.db.models import F, Q
 
-from .models import UploadBatch, UploadBatchRecord, UploadFieldMapping, TicketType, Exhibitor
 from .tasks import process_bulk_upload, commit_bulk_upload
 
 from .models import (
@@ -60,25 +64,16 @@ from .serializers import (
     LoginSerializer,
     RegistrationCreateSerializer,
     RegistrationUpdateSerializer,
-
-)
-
-
-
-
-import io
- 
-from django.shortcuts import get_object_or_404
-from rest_framework.parsers import MultiPartParser, FormParser
- 
-
-from .serializers import (
     UploadBatchSerializer,
     UploadBatchListSerializer,
     UploadBatchRecordSerializer,
     RecordEditSerializer,
+
 )
-from .tasks import process_bulk_upload, commit_bulk_upload
+
+
+
+
  
 
 
