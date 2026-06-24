@@ -21,6 +21,7 @@ urlpatterns = [
     path("register/<str:token>/complete/", InvitationRegisterCompleteView.as_view(), name="invitation_complete"), 
 
 
+    path("register/<str:token>/update-name/", InvitationRegisterUpdateNameView.as_view(), name="invitation_update_name"),
 
 
     # ────────────────────────────── Bulk Upload ──────────────────────────────────────

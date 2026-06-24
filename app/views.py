@@ -13,35 +13,24 @@ from django.db import transaction
 from .pagination import RegistrationPagination
 from django.core.cache import cache
 import io
- 
+from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from rest_framework.parsers import MultiPartParser, FormParser
-from .tasks import process_bulk_upload, commit_bulk_upload
-
-
 import pandas as pd
-
-
-
-from django.db.models import F, Q
-
+from .tasks import process_bulk_upload
+from django.db.models import F
 from .tasks import process_bulk_upload, commit_bulk_upload
 
 from .models import (
-    TicketType, 
-    BadgeAllocation, 
-    Exhibitor, 
+    TicketType,
+    BadgeAllocation,
+    Exhibitor,
     User,
     Registration,
     Invitation,
     UploadBatch,
-
-
-
     UploadBatchRecord,
     UploadFieldMapping,
-    TicketType,
-    Exhibitor,
 )
 
 from rest_framework.generics import (
@@ -122,43 +111,75 @@ class SendInvitationAPIView(APIView):
             email = entry.get("email", "").strip()
             ticket_type_id = entry.get("ticket_type_id")
 
-            # Validate
+            # ── Field Validation ─────────────────────────────
             row_errors = []
+
             if not first_name:
                 row_errors.append("First name is required.")
+
             if not last_name:
                 row_errors.append("Last name is required.")
+
             if not email:
                 row_errors.append("Email is required.")
+
             if not ticket_type_id:
                 row_errors.append("Ticket type is required.")
 
             if row_errors:
-                errors.append({"row": idx + 1, "email": email, "errors": row_errors})
+                errors.append({
+                    "row": idx + 1,
+                    "email": email,
+                    "errors": row_errors,
+                })
                 continue
 
-            # Check duplicate email
+            # ── Duplicate Email Check ───────────────────────
             if Registration.objects.filter(email=email).exists():
                 errors.append({
                     "row": idx + 1,
                     "email": email,
-                    "errors": ["Email already registered."]
+                    "errors": ["Email already registered."],
                 })
                 continue
 
+            # ── Ticket Validation ───────────────────────────
             try:
                 ticket = TicketType.objects.get(id=ticket_type_id)
+
             except TicketType.DoesNotExist:
                 errors.append({
                     "row": idx + 1,
                     "email": email,
-                    "errors": ["Invalid ticket type."]
+                    "errors": ["Invalid ticket type."],
                 })
                 continue
 
+            # ── Check Ticket Availability ───────────────────
+            used_count = Registration.objects.filter(
+                ticket_type=ticket
+            ).exclude(
+                status="cancelled"
+            ).count()
+
+            available_count = (
+                ticket.total_tickets - used_count
+            )
+
+            if available_count <= 0:
+                errors.append({
+                    "row": idx + 1,
+                    "email": email,
+                    "errors": [
+                        f"No available badges left for '{ticket.ticket_name}'."
+                    ],
+                })
+                continue
+
+            # ── Create Invitation Registration ──────────────
             try:
                 with transaction.atomic():
-                    # Create registration with invited status
+
                     reg = Registration.objects.create(
                         exhibitor=exhibitor,
                         ticket_type=ticket,
@@ -169,7 +190,6 @@ class SendInvitationAPIView(APIView):
                         status="invited",
                     )
 
-                    # Create invitation token
                     invitation = Invitation.objects.create(
                         registration=reg,
                         status="sent",
@@ -187,7 +207,7 @@ class SendInvitationAPIView(APIView):
                 errors.append({
                     "row": idx + 1,
                     "email": email,
-                    "errors": [str(e)]
+                    "errors": [str(e)],
                 })
 
         return Response(
@@ -199,7 +219,6 @@ class SendInvitationAPIView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
-
 
 # # POST /exhibitor/invitations/import/
 # # Upload CSV/Excel to import contacts for invitation
@@ -323,6 +342,7 @@ class InvitationRegisterCompleteView(APIView):
     authentication_classes = []
 
     def post(self, request, token):
+
         invitation = get_object_or_404(Invitation, token=token)
         reg = invitation.registration
 
@@ -332,7 +352,29 @@ class InvitationRegisterCompleteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Update remaining fields
+        # Check ticket availability
+        used_count = Registration.objects.filter(
+            ticket_type=reg.ticket_type
+        ).exclude(
+            status="cancelled"
+        ).exclude(
+            id=reg.id
+        ).count()
+
+        available_count = reg.ticket_type.total_tickets - used_count
+
+        if available_count <= 0:
+            return Response(
+                {
+                    "error": (
+                        f"No available badges left for "
+                        f"'{reg.ticket_type.ticket_name}'."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ↓ These were mistakenly indented inside the if block above
         reg.job_title = request.data.get("job_title", reg.job_title)
         reg.company_name = request.data.get("company_name", reg.company_name)
         reg.phone_number = request.data.get("phone_number", reg.phone_number)
@@ -343,21 +385,50 @@ class InvitationRegisterCompleteView(APIView):
         reg.save()
 
         from django.utils import timezone
+
         invitation.status = "completed"
         invitation.completed_at = timezone.now()
         invitation.save(update_fields=["status", "completed_at"])
 
+        return Response(
+            {
+                "message": "Registration completed successfully.",
+                "urn": reg.urn,
+                "name": f"{reg.first_name} {reg.last_name}",
+                "email": reg.email,
+            }
+        )
+
+class InvitationRegisterUpdateNameView(APIView):
+    permission_classes = []
+    authentication_classes = []
+
+    def put(self, request, token):
+        invitation = get_object_or_404(Invitation, token=token)
+        reg = invitation.registration
+
+        if reg.status == "confirmed":
+            return Response(
+                {"error": "This invitation has already been completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        first_name = request.data.get("first_name", "").strip()
+        last_name  = request.data.get("last_name", "").strip()
+
+        if not first_name:
+            return Response({"error": "First name is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not last_name:
+            return Response({"error": "Last name is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        reg.first_name = first_name
+        reg.last_name  = last_name
+        reg.save(update_fields=["first_name", "last_name"])
+
         return Response({
-            "message": "Registration completed successfully.",
-            "urn": reg.urn,
-            "name": f"{reg.first_name} {reg.last_name}",
-            "email": reg.email,
+            "first_name": reg.first_name,
+            "last_name":  reg.last_name,
         })
-
-
-
-
-
 
 
 
@@ -373,24 +444,23 @@ class InvitationRegisterCompleteView(APIView):
 
 def get_exhibitor(request):
     return get_object_or_404(Exhibitor, user=request.user)
-
-
-
+ 
+ 
 SYSTEM_FIELDS = [
-    {"key": "first_name", "label": "First Name", "required": True},
-    {"key": "last_name", "label": "Last Name", "required": True},
-    {"key": "email", "label": "Email", "required": True},
-    {"key": "job_title", "label": "Job Title", "required": False},
-    {"key": "company_name", "label": "Company Name", "required": False},
-    {"key": "phone_number", "label": "Phone Number", "required": False},
+    {"key": "first_name",           "label": "First Name",           "required": True},
+    {"key": "last_name",            "label": "Last Name",            "required": True},
+    {"key": "email",                "label": "Email",                "required": True},
+    {"key": "job_title",            "label": "Job Title",            "required": False},
+    {"key": "company_name",         "label": "Company Name",         "required": False},
+    {"key": "phone_number",         "label": "Phone Number",         "required": False},
     {"key": "country_of_residence", "label": "Country Of Residence", "required": False},
-    {"key": "nationality", "label": "Nationality", "required": False},
-    {"key": "ticket_type", "label": "Ticket Type", "required": True},
+    {"key": "nationality",          "label": "Nationality",          "required": False},
+    {"key": "ticket_type",          "label": "Ticket Type",          "required": True},
 ]
-
+ 
 REQUIRED_TARGET_FIELDS = {"first_name", "last_name", "email", "ticket_type"}
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # STEP 1 — Upload file, return columns preview
 # POST /exhibitor/bulk-upload/upload/
@@ -398,25 +468,25 @@ REQUIRED_TARGET_FIELDS = {"first_name", "last_name", "email", "ticket_type"}
 class BulkUploadFileView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
-
+ 
     def post(self, request):
         file = request.FILES.get("file")
         batch_name = request.data.get("batch_name", "").strip()
-
+ 
         if not file:
             return Response(
                 {"error": "No file provided."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         if not batch_name:
             return Response(
                 {"error": "Batch name is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         filename = file.name.lower()
-
+ 
         # Only parse a 5-row preview here — the full file is read once,
         # later, inside Celery (process_bulk_upload). Reading the whole
         # thing twice was a chunk of the original slowness.
@@ -435,13 +505,13 @@ class BulkUploadFileView(APIView):
                 {"error": f"Failed to read file: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         if preview_df.empty:
             return Response(
                 {"error": "Uploaded file is empty."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         # Cheap row count for display purposes only. The authoritative
         # count gets set again once process_bulk_upload actually parses
         # the full file.
@@ -459,11 +529,11 @@ class BulkUploadFileView(APIView):
                 wb.close()
         except Exception:
             total_records = 0
-
+ 
         file.seek(0)
-
+ 
         exhibitor = get_exhibitor(request)
-
+ 
         batch = UploadBatch.objects.create(
             exhibitor=exhibitor,
             batch_name=batch_name,
@@ -472,10 +542,10 @@ class BulkUploadFileView(APIView):
             total_records=total_records,
             status="uploaded",
         )
-
+ 
         columns = list(preview_df.columns)
         preview_rows = preview_df.fillna("").to_dict(orient="records")
-
+ 
         return Response(
             {
                 "batch_id": batch.id,
@@ -488,48 +558,38 @@ class BulkUploadFileView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # STEP 2 — Save field mapping, hand off to Celery
 # POST /exhibitor/bulk-upload/<batch_id>/map/
 # ─────────────────────────────────────────────
 class BulkUploadMapFieldsView(APIView):
-    """
-    Thin view: validate + persist the mapping, then queue Celery to do
-    the file parsing, UploadBatchRecord creation, and validation.
-
-    NOTE: your UploadBatch.STATUS_CHOICES only has
-    uploaded / processing / validated / completed / failed — there is
-    no "mapped" status, so we go straight to "processing" here and let
-    the Celery task own the rest of the lifecycle.
-    """
-
     permission_classes = [IsAuthenticated]
-
+ 
     def post(self, request, batch_id):
         batch = get_object_or_404(UploadBatch, id=batch_id)
-
+ 
         mappings = request.data.get("mappings", {})
-
+ 
         if not mappings:
             return Response(
                 {"error": "Field mappings are required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         mapped_targets = set(mappings.values())
         missing = REQUIRED_TARGET_FIELDS - mapped_targets
-
+ 
         if missing:
             return Response(
                 {"error": f"Missing required mappings: {', '.join(missing)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         with transaction.atomic():
             UploadFieldMapping.objects.filter(batch=batch).delete()
-
+ 
             UploadFieldMapping.objects.bulk_create(
                 [
                     UploadFieldMapping(
@@ -538,17 +598,17 @@ class BulkUploadMapFieldsView(APIView):
                     for source, target in mappings.items()
                 ]
             )
-
+ 
             batch.status = "processing"
             batch.progress_percentage = 0
             batch.processed_records = 0
             batch.save(
                 update_fields=["status", "progress_percentage", "processed_records"]
             )
-
+ 
         # Heavy lifting happens here, off the request/response cycle.
         process_bulk_upload.delay(batch.id, mappings)
-
+ 
         return Response(
             {
                 "message": "Field mapping saved. Processing started.",
@@ -557,18 +617,18 @@ class BulkUploadMapFieldsView(APIView):
             },
             status=status.HTTP_202_ACCEPTED,
         )
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # STEP 3 — Get batch status + records (with tabs)
 # GET /exhibitor/bulk-upload/<batch_id>/review/
 # ─────────────────────────────────────────────
 class BulkUploadReviewView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request, batch_id):
         batch = get_object_or_404(UploadBatch, id=batch_id)
-
+ 
         if batch.status not in ["validated", "completed"]:
             return Response(
                 {
@@ -583,35 +643,32 @@ class BulkUploadReviewView(APIView):
                     "records": [],
                 }
             )
-
+ 
         tab = request.query_params.get("tab", "all")
         search = request.query_params.get("search", "").strip()
-
-        # batch.records is the related_name on UploadBatchRecord.batch —
-        # functionally identical to UploadBatchRecord.objects.filter(batch=batch),
-        # using it here since it's already defined on your model.
+ 
         queryset = (
             batch.records.select_related("ticket_type").order_by("row_number")
         )
-
+ 
         if tab == "valid":
             queryset = queryset.filter(validation_status="valid")
         elif tab == "invalid":
             queryset = queryset.filter(validation_status="invalid")
-
+ 
         if search:
             queryset = queryset.filter(
                 Q(first_name__icontains=search)
                 | Q(last_name__icontains=search)
                 | Q(email__icontains=search)
             )
-
+ 
         paginator = PageNumberPagination()
         paginator.page_size = min(int(request.query_params.get("page_size", 50)), 100)
-
+ 
         page = paginator.paginate_queryset(queryset, request)
         serializer = UploadBatchRecordSerializer(page, many=True)
-
+ 
         return paginator.get_paginated_response(
             {
                 "batch_id": batch.id,
@@ -626,32 +683,49 @@ class BulkUploadReviewView(APIView):
                 "records": serializer.data,
             }
         )
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # STEP 4 — Edit a single invalid record
 # PATCH /exhibitor/bulk-upload/record/<record_id>/edit/
 # ─────────────────────────────────────────────
 class BulkUploadRecordEditView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     @transaction.atomic
     def patch(self, request, record_id):
+        # select_for_update() + select_related() causes Django to emit
+        # FOR UPDATE on the nullable side of an outer join — SQLite doesn't
+        # allow this. Fix: lock the bare row first, then re-fetch with joins.
+        get_object_or_404(UploadBatchRecord.objects.select_for_update(), id=record_id)
         record = get_object_or_404(
-            UploadBatchRecord.objects.select_related("batch__exhibitor").select_for_update(),
+            UploadBatchRecord.objects.select_related("batch__exhibitor", "ticket_type"),
             id=record_id,
         )
-
+ 
         old_status = record.validation_status
-
+ 
         serializer = RecordEditSerializer(record, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        record.refresh_from_db()
-
+        record.refresh_from_db(fields=[
+            "first_name", "last_name", "email",
+            "ticket_type_id", "validation_status", "error_message",
+        ])
+ 
         errors = []
-
-        # Check 1: duplicate within this batch (among other valid records)
+ 
+        # Check 1: required fields
+        if not record.first_name:
+            errors.append("First name is required.")
+        if not record.last_name:
+            errors.append("Last name is required.")
+        if not record.email:
+            errors.append("Email is required.")
+        if not record.ticket_type_id:
+            errors.append("Ticket type is required.")
+ 
+        # Check 2: duplicate within this batch (among other valid records)
         duplicate_in_batch = (
             UploadBatchRecord.objects.filter(
                 batch=record.batch,
@@ -661,35 +735,52 @@ class BulkUploadRecordEditView(APIView):
             .exclude(id=record.id)
             .exists()
         )
-
-        # Check 2: duplicate against already-committed registrations for this exhibitor
+ 
+        # Check 3: duplicate against already-committed registrations for this exhibitor
         duplicate_committed = Registration.objects.filter(
             exhibitor=record.batch.exhibitor,
             email=record.email,
         ).exists()
-
+ 
         if duplicate_in_batch or duplicate_committed:
             errors.append("Duplicate email found.")
-
-        if not record.first_name:
-            errors.append("First name is required.")
-
-        if not record.last_name:
-            errors.append("Last name is required.")
-
-        if not record.email:
-            errors.append("Email is required.")
-
-        if not record.ticket_type_id:
-            errors.append("Ticket type is required.")
-
+ 
+        # Check 4: quota — use TicketType.total_tickets minus confirmed registrations.
+        # Same source as process_bulk_upload and commit_bulk_upload tasks.
+        if not errors and record.ticket_type_id:
+            ticket_type_obj = record.ticket_type  # already loaded via select_related
+            total_allowed = ticket_type_obj.total_tickets
+ 
+            # Globally confirmed registrations for this ticket type
+            confirmed_count = Registration.objects.filter(
+                ticket_type_id=record.ticket_type_id,
+                status="confirmed",
+            ).count()
+ 
+            # Other valid records in this batch already consuming this ticket type
+            batch_usage = UploadBatchRecord.objects.filter(
+                batch=record.batch,
+                ticket_type_id=record.ticket_type_id,
+                validation_status="valid",
+            ).exclude(id=record.id).count()
+ 
+            total_used = confirmed_count + batch_usage
+ 
+            if total_used >= total_allowed:
+                errors.append(
+                    f"Badge quota exceeded for '{ticket_type_obj.ticket_name}' "
+                    f"({total_used} used of {total_allowed} available). "
+                    "Please contact your admin to allocate more badges "
+                    "or choose a different ticket type."
+                )
+ 
         is_valid = len(errors) == 0
         new_status = "valid" if is_valid else "invalid"
-
+ 
         record.validation_status = new_status
         record.error_message = None if is_valid else " | ".join(errors)
         record.save(update_fields=["validation_status", "error_message"])
-
+ 
         if old_status != new_status:
             if old_status == "invalid" and new_status == "valid":
                 UploadBatch.objects.filter(id=record.batch_id).update(
@@ -701,9 +792,9 @@ class BulkUploadRecordEditView(APIView):
                     valid_records=F("valid_records") - 1,
                     invalid_records=F("invalid_records") + 1,
                 )
-
+ 
         record.batch.refresh_from_db(fields=["valid_records", "invalid_records"])
-
+ 
         return Response(
             {
                 "message": "Record updated successfully",
@@ -712,30 +803,29 @@ class BulkUploadRecordEditView(APIView):
                 "batch_invalid_records": record.batch.invalid_records,
             }
         )
-
+ 
+ 
 # ─────────────────────────────────────────────
 # STEP 5 — Commit valid records to Registration
 # POST /exhibitor/bulk-upload/<batch_id>/commit/
 # ─────────────────────────────────────────────
 class BulkUploadCommitView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     @transaction.atomic
     def post(self, request, batch_id):
         batch = get_object_or_404(
             UploadBatch.objects.select_for_update(), id=batch_id
         )
-
+ 
         exhibitor = get_exhibitor(request)
-
-        # "committing" is caught here — a concurrent request that slips past
-        # the row lock after the first commit sets status will be rejected.
+ 
         if batch.status == "completed":
             return Response(
                 {"error": "Batch already committed."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         if batch.status not in ("validated",):
             return Response(
                 {
@@ -746,154 +836,136 @@ class BulkUploadCommitView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         if batch.valid_records == 0:
             return Response(
                 {"error": "No valid records to commit."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         # 1. Lock the status FIRST, inside the transaction.
-        #    Any concurrent request that acquires select_for_update after this
-        #    will see "committing" and be rejected above.
         batch.status = "committing"
         batch.save(update_fields=["status"])
-
-        # 2. Dispatch the Celery task ONLY after the transaction commits.
-        #    This prevents the worker from picking up the task before the
-        #    status change is visible in the database.
+ 
+        # 2. Dispatch Celery ONLY after the transaction commits so the worker
+        #    sees the status change before it starts.
         transaction.on_commit(
             lambda: commit_bulk_upload.delay(batch.id, exhibitor.id)
         )
-
+ 
         return Response(
             {
                 "message": "Commit started.",
                 "batch_id": batch.id,
                 "valid_records": batch.valid_records,
             }
-        )   
-
+        )
+ 
+ 
 # ─────────────────────────────────────────────
 # List all batches for exhibitor
 # GET /exhibitor/bulk-upload/batches/
 # ─────────────────────────────────────────────
 class BulkUploadBatchListView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request):
         exhibitor = get_exhibitor(request)
-        batches = UploadBatch.objects.filter(exhibitor=exhibitor).order_by(
-            "-uploaded_at"
-        )
+        batches = UploadBatch.objects.filter(exhibitor=exhibitor).order_by("-uploaded_at")
         serializer = UploadBatchListSerializer(batches, many=True)
         return Response(serializer.data)
-
-
+ 
+ 
 # ─────────────────────────────────────────────
 # Sample template download
 # GET /exhibitor/bulk-upload/sample-template/
 # ─────────────────────────────────────────────
 class BulkUploadSampleTemplateView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request):
         import openpyxl
         from django.http import HttpResponse
         from openpyxl.styles import Alignment, Font, PatternFill
-
+ 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Registrations"
-
+ 
         headers = [
-            "First Name",
-            "Last Name",
-            "Email",
-            "Job Title",
-            "Company Name",
-            "Phone Number",
-            "Country Of Residence",
-            "Nationality",
-            "Ticket Type",
+            "First Name", "Last Name", "Email", "Job Title", "Company Name",
+            "Phone Number", "Country Of Residence", "Nationality", "Ticket Type",
         ]
-
+ 
         header_font = Font(bold=True, color="FFFFFF", name="Arial")
         header_fill = PatternFill("solid", start_color="3f0e60")
-
+ 
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
-
-        ws.append(
-            [
-                "John",
-                "Doe",
-                "john.doe@example.com",
-                "Manager",
-                "ABC Company",
-                "+971501234567",
-                "United Arab Emirates",
-                "Emirati",
-                "Exhibitor Badge",
-            ]
-        )
-
+ 
+        ws.append([
+            "John", "Doe", "john.doe@example.com", "Manager", "ABC Company",
+            "+971501234567", "United Arab Emirates", "Emirati", "Exhibitor Badge",
+        ])
+ 
         col_widths = [15, 15, 30, 20, 25, 18, 25, 20, 20]
         for col, width in enumerate(col_widths, 1):
             ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
-
+ 
         buffer = io.BytesIO()
         wb.save(buffer)
         buffer.seek(0)
-
+ 
         response = HttpResponse(
             buffer.getvalue(),
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         response["Content-Disposition"] = 'attachment; filename="bulk_upload_template.xlsx"'
         return response
-
-
-
+ 
+ 
+# ─────────────────────────────────────────────
+# Bulk delete registrations by ID list
 # DELETE /exhibitor/registrations/bulk-delete/
 # Body: { "ids": [1, 2, 3] }
+# ─────────────────────────────────────────────
 class RegistrationBulkDeleteView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     def delete(self, request):
         ids = request.data.get("ids", [])
-
+ 
         if not ids:
             return Response({"error": "No IDs provided."}, status=status.HTTP_400_BAD_REQUEST)
         if not isinstance(ids, list):
             return Response({"error": "ids must be a list."}, status=status.HTTP_400_BAD_REQUEST)
         if len(ids) > 500:
             return Response({"error": "Cannot delete more than 500 records at once."}, status=status.HTTP_400_BAD_REQUEST)
-
+ 
         exhibitor = get_exhibitor(request)
-
+ 
         qs = Registration.objects.filter(id__in=ids, exhibitor=exhibitor)
-
+ 
         # Capture affected batches BEFORE deleting rows
         affected_batch_ids = list(
             qs.exclude(upload_batch__isnull=True)
               .values_list("upload_batch_id", flat=True)
               .distinct()
         )
-
+ 
         requested_count = len(ids)
-        deleted_count, _ = qs.delete()   # hard delete
-
+        deleted_count, _ = qs.delete()
+ 
         # Reconcile: if a "completed" batch has no registrations left, flip it back
         if affected_batch_ids:
             for batch in UploadBatch.objects.filter(id__in=affected_batch_ids, status="completed"):
                 if not Registration.objects.filter(upload_batch=batch, exhibitor=exhibitor).exists():
                     batch.status = "validated"
                     batch.save(update_fields=["status"])
-
+ 
         return Response(
             {
                 "message": f"{deleted_count} registration(s) deleted.",
@@ -902,55 +974,78 @@ class RegistrationBulkDeleteView(APIView):
             },
             status=status.HTTP_200_OK,
         )
-
+ 
+ 
+# ─────────────────────────────────────────────
+# Delete all registrations for a committed batch
 # DELETE /exhibitor/bulk-upload/<batch_id>/delete-registrations/
+# ─────────────────────────────────────────────
 class BulkUploadDeleteRegistrationsView(APIView):
     permission_classes = [IsAuthenticated]
-
+ 
     def delete(self, request, batch_id):
         exhibitor = get_exhibitor(request)
         batch = get_object_or_404(UploadBatch, id=batch_id, exhibitor=exhibitor)
-
+ 
         if batch.status != "completed":
             return Response(
                 {"error": "This batch has not been committed yet."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         deleted_count, _ = Registration.objects.filter(
             upload_batch=batch, exhibitor=exhibitor,
-        ).delete()   # hard delete
-
+        ).delete()
+ 
         if deleted_count == 0:
             return Response(
                 {"error": "No registrations found for this batch. They may have already been deleted."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+ 
         batch.status = "validated"
         batch.save(update_fields=["status"])
-
+ 
         return Response({
             "message": f"{deleted_count} registrations deleted.",
             "deleted_count": deleted_count,
         })
-
+ 
 
 
 
 class RegistrationCreateAPIView(CreateAPIView):
-
-    serializer_class = (RegistrationCreateSerializer)
-
+    serializer_class = RegistrationCreateSerializer
     permission_classes = [IsAuthenticated]
 
-    def perform_create(self,serializer):
+    def perform_create(self, serializer):
 
-        exhibitor = (self.request.user.exhibitor_profile)
+        exhibitor = self.request.user.exhibitor_profile
+        ticket_type = serializer.validated_data["ticket_type"]
 
-        serializer.save(exhibitor=exhibitor,status="confirmed",)
+        used_count = Registration.objects.filter(
+            ticket_type=ticket_type
+        ).exclude(
+            status="cancelled"
+        ).count()
 
+        available_count = (
+            ticket_type.total_tickets - used_count
+        )
 
+        if available_count <= 0:
+            raise ValidationError(
+                {
+                    "ticket_type":
+                    f"No available badges left for '{ticket_type.ticket_name}'."
+                }
+            )
+
+        serializer.save(
+            exhibitor=exhibitor,
+            status="confirmed",
+            registered_via="single_badge",
+        )
 
 class RegistrationUpdateAPIView(UpdateAPIView):
 
@@ -1023,41 +1118,77 @@ class ExhibitorDashboardAPIView(APIView):
     def get(self, request):
         exhibitor = request.user.exhibitor_profile
 
-        allocated_badges = (
-            BadgeAllocation.objects.filter(
-                exhibitor=exhibitor
-            ).aggregate(
-                total=Sum("allocated_count")
-            )["total"] or 0
-        )
-
+        # ── Status counts ─────────────────────────────────────────────────────
         status_counts = (
-            Registration.objects.filter(
-                exhibitor=exhibitor
-            )
+            Registration.objects.filter(exhibitor=exhibitor)
             .values("status")
             .annotate(count=Count("id"))
         )
-
-        counts = {
-            item["status"]: item["count"]
-            for item in status_counts
-        }
-
+        counts    = {item["status"]: item["count"] for item in status_counts}
         confirmed = counts.get("confirmed", 0)
-        pending = counts.get("pending", 0)
-        invited = counts.get("invited", 0)
+        pending   = counts.get("pending",   0)
+        invited   = counts.get("invited",   0)
 
-        available_badges = allocated_badges - confirmed
+        # ── Per-ticket-type breakdown ─────────────────────────────────────────
+        # Prefer BadgeAllocation if it exists, fall back to TicketType.total_tickets
+        allocations = (
+            BadgeAllocation.objects.filter(exhibitor=exhibitor)
+            .select_related("ticket_type")
+        )
+
+        ticket_breakdown = []
+        total_allocated  = 0
+
+        if allocations.exists():
+            # Admin has explicitly allocated badges — use those numbers
+            for alloc in allocations:
+                tt   = alloc.ticket_type
+                used = Registration.objects.filter(
+                    exhibitor=exhibitor,
+                    ticket_type=tt,
+                ).exclude(status="cancelled").count()
+
+                allocated     = alloc.allocated_count
+                total_allocated += allocated
+
+                ticket_breakdown.append({
+                    "id":          tt.id,
+                    "ticket_name": tt.ticket_name,
+                    "allocated":   allocated,
+                    "used":        used,
+                    "available":   max(allocated - used, 0),
+                })
+
+        else:
+            # No BadgeAllocation yet — fall back to TicketType.total_tickets
+            ticket_types = TicketType.objects.filter(status="active")
+
+            for tt in ticket_types:
+                used = Registration.objects.filter(
+                    exhibitor=exhibitor,
+                    ticket_type=tt,
+                ).exclude(status="cancelled").count()
+
+                allocated     = tt.total_tickets
+                total_allocated += allocated
+
+                ticket_breakdown.append({
+                    "id":          tt.id,
+                    "ticket_name": tt.ticket_name,
+                    "allocated":   allocated,
+                    "used":        used,
+                    "available":   max(allocated - used, 0),
+                })
 
         return Response({
-            "allocated_badges": allocated_badges,
-            "confirmed": confirmed,
-            "pending": pending,
-            "invited": invited,
-            "available_badges": available_badges,
+            "allocated_badges": total_allocated,
+            "confirmed":        confirmed,
+            "pending":          pending,
+            "invited":          invited,
+            "available_badges": max(total_allocated - confirmed, 0),
+            "ticket_breakdown": ticket_breakdown,
         })
-
+                
 class ExhibitorLoginAPIView(APIView):
 
     permission_classes = []
@@ -1175,95 +1306,84 @@ class TicketTypeDetailAPIView(RetrieveAPIView):
     serializer_class = (TicketTypeListSerializer)
 
 class DeleteTicketTypeAPIView(APIView):
+    permission_classes = [IsAuthenticated]
 
-    def delete(self,request,pk):
-
-        ticket = TicketType.objects.get(id=pk)
-
-        ticket.status = ("inactive")
-
+    def delete(self, request, pk):
+        ticket = get_object_or_404(TicketType, id=pk)
+        ticket.status = "inactive"
         ticket.save()
 
         return Response(
-            {
-                "message":
-                "Ticket deactivated"
-            }
+            {"message": "Ticket deactivated"},
+            status=status.HTTP_200_OK
         )
 
 
 class UpdateTicketTypeAPIView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def put(self, request, pk):
-
-        serializer = (TicketTypeUpdateSerializer( data=request.data))
-
+        ticket = get_object_or_404(TicketType, id=pk)
+        serializer = TicketTypeUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        ticket = TicketType.objects.get(id=pk)
-
         data = serializer.validated_data
-
-        if "ticket_name" in data:
-
-            ticket.ticket_name = data["ticket_name"]
-
-        if "description" in data:
-
-            ticket.description = data["description"]
-
-        if "status" in data:
-
-            ticket.status = data["status"]
-
+        for field, value in data.items():
+            setattr(ticket, field, value)
         ticket.save()
 
         return Response(
             {
-                "message":
-                "Ticket updated"
-            }
+                "message": "Ticket updated",
+                "ticket": {
+                    "id": ticket.id,
+                    "ticket_name": ticket.ticket_name,
+                    "ticket_code": ticket.ticket_code,
+                    "total_tickets": ticket.total_tickets,
+                    "description": ticket.description,
+                    "status": ticket.status,
+                }
+            },
+            status=status.HTTP_200_OK
         )
 
-
 class TicketTypeListAPIView(ListAPIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    serializer_class = TicketTypeListSerializer
 
-    queryset = (TicketType.objects.all().order_by("-id"))
+    def get_queryset(self):
+        return TicketType.objects.filter(status="active")
 
-    serializer_class = (TicketTypeListSerializer)
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
 
+        if hasattr(self.request.user, "exhibitor_profile"):
+            context["exhibitor"] = self.request.user.exhibitor_profile
+
+        return context
 
 
 class CreateTicketTypeAPIView(APIView):
 
-    def post(self,request):
+    def post(self, request):
 
-        serializer = (TicketTypeCreateSerializer(data=request.data))
-
+        serializer = TicketTypeCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         data = serializer.validated_data
 
         ticket = TicketType.objects.create(
             ticket_name=data["ticket_name"],
             ticket_code=data["ticket_code"],
-            description=data.get(
-                "description",
-                ""
-            )
+            total_tickets=data["total_tickets"],
+            description=data.get("description", ""),
+            status="active",   # ← explicit, don't rely on a model/db default
         )
 
         return Response(
-            {
-                "message":
-                "Ticket type created",
-
-                "id":
-                ticket.id
-            },
+            {"message": "Ticket type created", "id": ticket.id},
             status=201
         )
-
 
 class AllocateBadgeAPIView(APIView):
 

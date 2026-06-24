@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import TicketType,  User, Exhibitor, Registration, UploadBatch, UploadBatchRecord, UploadFieldMapping
+from .models import TicketType,  User, Exhibitor, Registration, UploadBatch, UploadBatchRecord, UploadFieldMapping, BadgeAllocation
 
 
 
@@ -151,13 +151,12 @@ class RegistrationListSerializer(serializers.ModelSerializer):
         source="ticket_type.ticket_name",
         read_only=True
     )
-
-    full_name = serializers.SerializerMethodField()
-
-    invitation_link = (
-        serializers.SerializerMethodField()
+    ticket_type_id = serializers.IntegerField(   # ← flat ID for modal select
+        source="ticket_type.id",
+        read_only=True
     )
-
+    full_name = serializers.SerializerMethodField()
+    invitation_link = serializers.SerializerMethodField()
     batch_name = serializers.CharField(
         source="upload_batch.batch_name",
         read_only=True,
@@ -165,46 +164,33 @@ class RegistrationListSerializer(serializers.ModelSerializer):
     )
 
     class Meta:
-
         model = Registration
-
         fields = [
             "id",
             "urn",
             "full_name",
+            "first_name",           # ← was missing
+            "last_name",            # ← was missing
+            "phone_number",         # ← was missing
+            "nationality",          # ← was missing
+            "country_of_residence", # ← was missing
+            "ticket_type_id",       # ← was missing (needed for select)
             "job_title",
             "email",
-            "ticket_name",
             "company_name",
+            "ticket_name",
             "invitation_link",
             "status",
             "batch_name",
         ]
 
     def get_full_name(self, obj):
+        return f"{obj.first_name} {obj.last_name}"
 
-        return (
-            f"{obj.first_name} "
-            f"{obj.last_name}"
-        )
-
-    def get_invitation_link(
-        self,
-        obj
-    ):
-
-        if hasattr(
-            obj,
-            "invitation"
-        ):
-
-            return (
-                obj.invitation
-                .invitation_link
-            )
-
+    def get_invitation_link(self, obj):
+        if hasattr(obj, "invitation"):
+            return obj.invitation.invitation_link
         return None
-
         
 
 class ExhibitorLoginSerializer(
@@ -326,6 +312,8 @@ class TicketTypeCreateSerializer(serializers.Serializer):
         max_length=50
     )
 
+    total_tickets = serializers.IntegerField(min_value=1) 
+
     description = serializers.CharField(
         required=False,
         allow_blank=True
@@ -354,6 +342,11 @@ class TicketTypeUpdateSerializer(serializers.Serializer):
         required=False
     )
 
+    total_tickets = serializers.IntegerField(
+        min_value=1,
+        required=False
+    )
+
     description = serializers.CharField(
         required=False
     )
@@ -366,23 +359,34 @@ class TicketTypeUpdateSerializer(serializers.Serializer):
         required=False
     )
 
-
 class TicketTypeListSerializer(serializers.ModelSerializer):
 
+    used_count = serializers.SerializerMethodField()
+    available_count = serializers.SerializerMethodField()
+
     class Meta:
-
         model = TicketType
-
         fields = (
             "id",
             "ticket_name",
             "ticket_code",
-            "description",
+            "total_tickets",
+            "used_count",
+            "available_count",
             "status",
-            "created_at"
         )
 
+    def get_used_count(self, obj):
+        return Registration.objects.filter(
+            ticket_type=obj
+        ).exclude(
+            status="cancelled"
+        ).count()
 
+    def get_available_count(self, obj):
+        used = self.get_used_count(obj)
+        return obj.total_tickets - used
+        
 class BadgeAllocationSerializer(serializers.Serializer):
 
     exhibitor_id = serializers.IntegerField()

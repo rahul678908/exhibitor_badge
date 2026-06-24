@@ -1,84 +1,92 @@
 import uuid
- 
+
+import numpy as np
 import pandas as pd
 from celery import shared_task
 from django.core.cache import cache
-from django.core.exceptions import ValidationError
-from django.core.validators import validate_email
 from django.db import transaction
- 
-from .models import Exhibitor, Registration, TicketType, UploadBatch, UploadBatchRecord
- 
-DB_BATCH_SIZE = 5000
-PROGRESS_UPDATE_EVERY = 5000
- 
-# SQLite hard-limits IN clauses to 999 bind variables.
-# Postgres has no such limit, but chunking works fine on both.
+
+from .models import (
+    Exhibitor,
+    Registration,
+    TicketType,
+    UploadBatch,
+    UploadBatchRecord,
+)
+
+DB_BATCH_SIZE = 5_000
 SQLITE_SAFE_IN_LIMIT = 900
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
- 
+
 def _read_dataframe(file_obj, file_name):
     name = file_name.lower()
- 
     if name.endswith(".csv"):
         return pd.read_csv(file_obj, dtype=str, keep_default_na=False)
- 
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(file_obj, engine="openpyxl", dtype=str)
- 
     raise ValueError("Only CSV and Excel files are supported.")
- 
- 
+
+
 def _get_ticket_type_map():
     ticket_types = cache.get("active_ticket_types")
- 
     if not ticket_types:
         ticket_types = {
             t.ticket_name.strip().lower(): t.id
             for t in TicketType.objects.filter(status="active")
         }
         cache.set("active_ticket_types", ticket_types, 3600)
- 
     return ticket_types
- 
- 
+
+
 def _fetch_existing_emails_chunked(email_set):
     """
-    BUG FIX 1 — 'too many SQL variables':
     SQLite crashes when you pass 1000+ values into a single IN clause.
-    This splits the lookup into chunks of 900, which is safe on SQLite
-    and has no downside on Postgres.
+    Split into chunks of 900 — safe on both SQLite and Postgres.
     """
     emails = list(email_set)
     existing = set()
- 
     for i in range(0, len(emails), SQLITE_SAFE_IN_LIMIT):
-        chunk = emails[i : i + SQLITE_SAFE_IN_LIMIT]
+        chunk = emails[i: i + SQLITE_SAFE_IN_LIMIT]
         existing.update(
             e.lower()
             for e in Registration.objects.filter(
                 email__in=chunk
             ).values_list("email", flat=True)
         )
- 
     return existing
- 
- 
+
+
+def _build_errors(row):
+    msgs = []
+    if row["err_no_first"]:
+        msgs.append("First name is required.")
+    if row["err_digit_first"]:                          # ← ADD
+        msgs.append("First name must not contain numbers.")
+    if row["err_no_last"]:
+        msgs.append("Last name is required.")
+    if row["err_digit_last"]:                           # ← ADD
+        msgs.append("Last name must not contain numbers.")
+    if row["err_no_email"]:
+        msgs.append("Email is required.")
+    elif row["err_bad_email"]:
+        msgs.append("Invalid email format.")
+    if row["err_email_exists"]:
+        msgs.append("Email already exists in registrations.")
+    if row["err_duplicate"]:
+        msgs.append("Duplicate email within this upload.")
+    if row["err_no_ticket"]:
+        msgs.append("Ticket type is required or not recognized.")
+    if row["err_quota_exceeded"]:
+        msgs.append("Requested records exceed available ticket balance.")
+    return " | ".join(msgs)
+
 # ─────────────────────────────────────────────────────────────
 # Task 1 — parse + validate the uploaded file
 # ─────────────────────────────────────────────────────────────
- 
-import pandas as pd
-import numpy as np
-from django.core.validators import validate_email
-from django.core.exceptions import ValidationError
-
-DB_BATCH_SIZE = 5000
-PROGRESS_UPDATE_EVERY = 10000  # Less frequent = faster
 
 @shared_task(bind=True, max_retries=2)
 def process_bulk_upload(self, batch_id, mappings):
@@ -107,7 +115,6 @@ def process_bulk_upload(self, batch_id, mappings):
             if col not in df.columns:
                 df[col] = ""
 
-        # Strip required string columns once, vectorized
         for col in ["first_name", "last_name", "email", "ticket_type"]:
             df[col] = df[col].astype(str).str.strip()
 
@@ -115,67 +122,100 @@ def process_bulk_upload(self, batch_id, mappings):
         total = len(df)
 
         # ── 2. Pre-load ALL lookups into memory (zero per-row queries) ──
-        ticket_type_map = _get_ticket_type_map()  # {name_lower: id}
+        ticket_type_map = _get_ticket_type_map()
 
         batch_emails = set(df["email_lower"]) - {""}
         existing_emails = _fetch_existing_emails_chunked(batch_emails)
 
-        # ── 3. Vectorized validation — no Python loop ──────────────────
+        # Quota map: TicketType.total_tickets minus already-confirmed registrations.
+        # This is a global pool — same source used by the commit task and edit view.
+        quota_map = {
+            t.id: t.total_tickets - Registration.objects.filter(
+                ticket_type=t, status="confirmed"
+            ).count()
+            for t in TicketType.objects.filter(status="active")
+        }
 
-        # Map ticket types
+        # ── 3. Vectorized validation ───────────────────────────────────
         df["ticket_type_id_val"] = df["ticket_type"].str.lower().map(ticket_type_map)
-
-        # Duplicate emails WITHIN this batch (keep first, flag rest)
-        df["is_batch_duplicate"] = df["email_lower"].duplicated(keep="first") & (df["email_lower"] != "")
-
-        # Boolean error columns — all vectorized
-        err_no_first   = df["first_name"].eq("")
-        err_no_last    = df["last_name"].eq("")
-        err_no_email   = df["email"].eq("")
-        err_bad_email  = ~err_no_email & ~df["email"].str.match(
-            r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
+        df["is_batch_duplicate"] = (
+            df["email_lower"].duplicated(keep="first") & (df["email_lower"] != "")
         )
-        err_email_exists = df["email_lower"].isin(existing_emails) & ~err_no_email
-        err_duplicate    = df["is_batch_duplicate"]
-        err_no_ticket    = df["ticket_type_id_val"].isna()
 
-        # Build error messages vectorized
-        def build_errors(row):
-            """Called only on INVALID rows — much smaller set."""
-            msgs = []
-            if row["err_no_first"]:   msgs.append("First name is required.")
-            if row["err_no_last"]:    msgs.append("Last name is required.")
-            if row["err_no_email"]:   msgs.append("Email is required.")
-            elif row["err_bad_email"]: msgs.append("Invalid email format.")
-            if row["err_email_exists"]: msgs.append("Email already exists in registrations.")
-            if row["err_duplicate"]:  msgs.append("Duplicate email within this upload.")
-            if row["err_no_ticket"]:  msgs.append("Ticket type is required or not recognized.")
-            return " | ".join(msgs)
-
-        # Attach error flag columns temporarily
-        df["err_no_first"]     = err_no_first
-        df["err_no_last"]      = err_no_last
-        df["err_no_email"]     = err_no_email
-        df["err_bad_email"]    = err_bad_email
-        df["err_email_exists"] = err_email_exists
-        df["err_duplicate"]    = err_duplicate
-        df["err_no_ticket"]    = err_no_ticket
-
-        any_error = (
-            err_no_first | err_no_last | err_no_email |
-            err_bad_email | err_email_exists | err_duplicate | err_no_ticket
+        # BUG FIX 1: assign all err_* columns to df HERE, before the quota loop,
+        # so that row["err_no_first"] etc. are accessible inside the loop.
+        df["err_no_first"]     = df["first_name"].eq("")
+        df["err_no_last"]      = df["last_name"].eq("")
+        df["err_no_email"]     = df["email"].eq("")
+        df["err_digit_first"]  = df["first_name"].str.contains(r"\d", regex=True) & ~df["err_no_first"]
+        df["err_digit_last"]   = df["last_name"].str.contains(r"\d", regex=True) & ~df["err_no_last"]
+        df["err_bad_email"]    = (
+            ~df["err_no_email"]
+            & ~df["email"].str.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
         )
-        df["validation_status"] = np.where(any_error, "invalid", "valid")
+        df["err_email_exists"] = df["email_lower"].isin(existing_emails) & ~df["err_no_email"]
+        df["err_duplicate"]    = df["is_batch_duplicate"]
+        df["err_no_ticket"]    = df["ticket_type_id_val"].isna()
 
-        # Build error messages only for invalid rows
-        invalid_mask = any_error
-        df["error_message"] = None
-        if invalid_mask.any():
-            df.loc[invalid_mask, "error_message"] = (
-                df[invalid_mask].apply(build_errors, axis=1)
+        # ── 4. Per-row quota check (must be sequential) ─────────────────
+        #       Scenario: 9 TradePass available, 10 uploaded → rows 1-9 valid,
+        #       row 10 gets err_quota_exceeded=True.
+        #       Rows already invalid for OTHER reasons do not consume quota.
+        remaining_quota = dict(quota_map)   # mutable copy
+        err_quota_exceeded_list = []
+
+        for _, row in df.iterrows():
+            tid = row["ticket_type_id_val"]
+
+            already_invalid = (
+                row["err_no_first"]     or
+                row["err_no_last"]      or
+                row["err_digit_first"]  or   # ← ADD
+                row["err_digit_last"]   or   # ← ADD
+                row["err_no_email"]     or
+                row["err_bad_email"]    or
+                row["err_email_exists"] or
+                row["err_duplicate"]    or
+                row["err_no_ticket"]
             )
 
-        # ticket_type_id: NaN → None for DB
+            if already_invalid or pd.isna(tid):
+                err_quota_exceeded_list.append(False)
+                continue
+
+            tid = int(tid)
+
+            if tid not in remaining_quota or remaining_quota[tid] <= 0:
+                err_quota_exceeded_list.append(True)
+            else:
+                remaining_quota[tid] -= 1   # consume one slot
+                err_quota_exceeded_list.append(False)
+
+        # BUG FIX 2: the original code discarded err_quota_exceeded_list and
+        # re-assigned df["err_quota_exceeded"] using `blocked_ticket_ids`
+        # which was never defined → NameError crash. Use the list we built above.
+        df["err_quota_exceeded"] = err_quota_exceeded_list
+
+        # ── 5. Final valid/invalid determination ───────────────────────
+        any_error = (
+            df["err_no_first"]      |
+            df["err_no_last"]       |
+            df["err_digit_first"]   |   # ← ADD
+            df["err_digit_last"]    |   # ← ADD
+            df["err_no_email"]      |
+            df["err_bad_email"]     |
+            df["err_email_exists"]  |
+            df["err_duplicate"]     |
+            df["err_no_ticket"]     |
+            df["err_quota_exceeded"]
+        )
+
+        df["validation_status"] = np.where(any_error, "invalid", "valid")
+
+        df["error_message"] = None
+        if any_error.any():
+            df.loc[any_error, "error_message"] = df[any_error].apply(_build_errors, axis=1)
+
         df["ticket_type_id_val"] = df["ticket_type_id_val"].where(
             df["ticket_type_id_val"].notna(), other=None
         )
@@ -183,7 +223,7 @@ def process_bulk_upload(self, batch_id, mappings):
         valid_count   = int((df["validation_status"] == "valid").sum())
         invalid_count = int((df["validation_status"] == "invalid").sum())
 
-        # ── 4. Clear old records, bulk_create in chunks ────────────────
+        # ── 6. Clear old records, bulk-create in chunks ────────────────
         UploadBatchRecord.objects.filter(batch=batch).delete()
 
         records = [
@@ -201,7 +241,10 @@ def process_bulk_upload(self, batch_id, mappings):
                 ticket_type_id=(
                     int(row.ticket_type_id_val)
                     if row.ticket_type_id_val is not None
-                    and not (isinstance(row.ticket_type_id_val, float) and np.isnan(row.ticket_type_id_val))
+                    and not (
+                        isinstance(row.ticket_type_id_val, float)
+                        and np.isnan(row.ticket_type_id_val)
+                    )
                     else None
                 ),
                 validation_status=row.validation_status,
@@ -210,18 +253,16 @@ def process_bulk_upload(self, batch_id, mappings):
             for i, row in enumerate(df.itertuples(index=False))
         ]
 
-        # bulk_create in chunks + update progress
         for chunk_start in range(0, len(records), DB_BATCH_SIZE):
             chunk = records[chunk_start: chunk_start + DB_BATCH_SIZE]
             UploadBatchRecord.objects.bulk_create(chunk, batch_size=DB_BATCH_SIZE)
-
             processed_so_far = min(chunk_start + DB_BATCH_SIZE, total)
             UploadBatch.objects.filter(id=batch.id).update(
                 processed_records=processed_so_far,
                 progress_percentage=int((processed_so_far / total) * 100),
             )
 
-        # ── 5. Final batch update ──────────────────────────────────────
+        # ── 7. Final batch update ──────────────────────────────────────
         batch.valid_records     = valid_count
         batch.invalid_records   = invalid_count
         batch.processed_records = total
@@ -237,12 +278,13 @@ def process_bulk_upload(self, batch_id, mappings):
 
     except Exception as exc:
         UploadBatch.objects.filter(id=batch_id).update(status="failed")
-        raise self.retry(exc=exc, countdown=10) 
- 
+        raise self.retry(exc=exc, countdown=10)
+
+
 # ─────────────────────────────────────────────────────────────
 # Task 2 — commit valid records to Registration
 # ─────────────────────────────────────────────────────────────
- 
+
 @shared_task(bind=True)
 def commit_bulk_upload(self, batch_id, exhibitor_id):
     try:
@@ -250,7 +292,6 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
         with transaction.atomic():
             batch = UploadBatch.objects.select_for_update().get(id=batch_id)
 
-            # Guard against duplicate task execution (e.g. Celery retry storms)
             if batch.status == "completed":
                 return {"skipped": True, "reason": "Already committed."}
             if batch.status == "failed":
@@ -268,20 +309,62 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
                 return {"error": "No valid records found."}
         # Lock released — safe to do expensive work below
 
-        # ── 2. Deduplicate against committed registrations ──────────────
+        # ── 2. Deduplicate against committed registrations ─────────────
         incoming_emails = {r.email.lower() for r in valid_records}
         already_exists = set(
             Registration.objects.filter(email__in=incoming_emails)
             .values_list("email", flat=True)
         )
-        skipped = [r for r in valid_records if r.email.lower() in already_exists]
+        skipped  = [r for r in valid_records if r.email.lower() in already_exists]
         to_insert = [r for r in valid_records if r.email.lower() not in already_exists]
+
+        # ── 3. Re-check quota at commit time (race-condition guard) ─────
+        # Use same source as process_bulk_upload: TicketType.total_tickets
+        # minus already-confirmed registrations.
+        quota_remaining = {}
+        for t in TicketType.objects.filter(status="active"):
+            confirmed = Registration.objects.filter(
+                ticket_type=t, status="confirmed"
+            ).count()
+            quota_remaining[t.id] = t.total_tickets - confirmed
+
+        quota_approved = []
+        quota_rejected = []
+
+        for record in to_insert:
+            tid = record.ticket_type_id
+            if tid not in quota_remaining or quota_remaining[tid] <= 0:
+                quota_rejected.append(record)
+            else:
+                quota_remaining[tid] -= 1
+                quota_approved.append(record)
+
+        if quota_rejected:
+            UploadBatchRecord.objects.filter(
+                id__in=[r.id for r in quota_rejected]
+            ).update(
+                validation_status="invalid",
+                error_message="Requested records exceed available ticket balance. Please contact your admin to allocate more badges or choose a different ticket type.",
+            )
+
+        to_insert = quota_approved
 
         if not to_insert:
             UploadBatch.objects.filter(id=batch_id).update(status="completed")
-            return {"inserted": 0, "skipped": len(skipped), "reason": "All emails already registered."}
+            return {
+                "inserted": 0,
+                "skipped_duplicates": len(skipped),
+                "quota_rejected": len(quota_rejected),
+                "reason": "All records skipped — duplicates or quota exhausted.",
+            }
 
-        # ── 3. Bulk insert ──────────────────────────────────────────────
+        # ── 4. Bulk insert ─────────────────────────────────────────────
+        # NOTE: bulk_create()'s returned objects only have .id populated
+        # when the backend supports RETURNING on multi-row inserts. On
+        # SQLite (depending on the sqlite3 lib version) this silently
+        # comes back as None, so we can't trust r.id here. Instead we
+        # look the rows back up by the unique temp urn we just assigned —
+        # that works identically on every backend.
         created_ids = []
         with transaction.atomic():
             buffer = []
@@ -306,15 +389,25 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
                     )
                 )
                 if len(buffer) >= DB_BATCH_SIZE:
-                    created = Registration.objects.bulk_create(buffer, batch_size=DB_BATCH_SIZE)
-                    created_ids.extend([r.id for r in created if r.id])
+                    Registration.objects.bulk_create(buffer, batch_size=DB_BATCH_SIZE)
+                    created_ids.extend(
+                        Registration.objects.filter(
+                            upload_batch=batch,
+                            urn__in=[r.urn for r in buffer],
+                        ).values_list("id", flat=True)
+                    )
                     buffer = []
 
             if buffer:
-                created = Registration.objects.bulk_create(buffer, batch_size=DB_BATCH_SIZE)
-                created_ids.extend([r.id for r in created if r.id])
+                Registration.objects.bulk_create(buffer, batch_size=DB_BATCH_SIZE)
+                created_ids.extend(
+                    Registration.objects.filter(
+                        upload_batch=batch,
+                        urn__in=[r.urn for r in buffer],
+                    ).values_list("id", flat=True)
+                )
 
-        # ── 4. URN update in its own atomic block ───────────────────────
+        # ── 5. URN update in its own atomic block ───────────────────────
         if created_ids:
             with transaction.atomic():
                 regs = Registration.objects.filter(id__in=created_ids, urn__startswith="_tmp_")
@@ -322,7 +415,7 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
                     reg.urn = f"GF2026-{reg.id:06d}"
                 Registration.objects.bulk_update(regs, ["urn"], batch_size=DB_BATCH_SIZE)
 
-        # ── 5. Mark complete ────────────────────────────────────────────
+        # ── 6. Mark complete ────────────────────────────────────────────
         UploadBatch.objects.filter(id=batch_id).update(status="completed")
 
         return {
