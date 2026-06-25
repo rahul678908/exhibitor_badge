@@ -1,6 +1,119 @@
 from rest_framework import serializers
 from .models import TicketType,  User, Exhibitor, Registration, UploadBatch, UploadBatchRecord, UploadFieldMapping, BadgeAllocation
+from django.db.models import Sum
 
+class BadgeAllocationListSerializer(serializers.ModelSerializer):
+    ticket_name     = serializers.CharField(source="ticket_type.ticket_name")
+    ticket_code     = serializers.CharField(source="ticket_type.ticket_code")
+    used_count      = serializers.SerializerMethodField()
+    available_count = serializers.SerializerMethodField()
+ 
+    class Meta:
+        model = BadgeAllocation
+        fields = [
+            "id", "ticket_type", "ticket_name", "ticket_code",
+            "allocated_count", "used_count", "available_count", "remarks",
+        ]
+ 
+    def get_used_count(self, obj):
+        return Registration.objects.filter(
+            exhibitor=obj.exhibitor, ticket_type=obj.ticket_type
+        ).exclude(status="cancelled").count()
+ 
+    def get_available_count(self, obj):
+        return obj.allocated_count - self.get_used_count(obj)
+
+
+
+
+class TicketTypeSerializer(serializers.ModelSerializer):
+    """
+    Adds three computed read-only fields so the admin Ticket Management table
+    can show allocation vs usage at a glance.
+    """
+ 
+    # Sum of all BadgeAllocation.allocated_count for this ticket type
+    total_allocated = serializers.SerializerMethodField()
+ 
+    # Confirmed registrations against this ticket type (global)
+    total_used = serializers.SerializerMethodField()
+ 
+    # Seats still free to be allocated to additional exhibitors
+    unallocated_count = serializers.SerializerMethodField()
+ 
+    class Meta:
+        model = TicketType
+        fields = [
+            "id", "ticket_name", "ticket_code", "total_tickets", "status",
+            "description",
+            "total_allocated",   # NEW
+            "total_used",        # NEW
+            "unallocated_count", # NEW
+        ]
+ 
+    def get_total_allocated(self, obj):
+        return (
+            BadgeAllocation.objects.filter(ticket_type=obj)
+            .aggregate(total=Sum("allocated_count"))["total"] or 0
+        )
+ 
+    def get_total_used(self, obj):
+        return (
+            Registration.objects.filter(ticket_type=obj, status="confirmed").count()
+        )
+ 
+    def get_unallocated_count(self, obj):
+        total_alloc = self.get_total_allocated(obj)
+        return max(0, obj.total_tickets - total_alloc)
+
+
+class BadgeAllocationListSerializer(serializers.ModelSerializer):
+    ticket_name = serializers.CharField(source="ticket_type.ticket_name")
+    ticket_code = serializers.CharField(source="ticket_type.ticket_code")
+    used_count = serializers.SerializerMethodField()
+    available_count = serializers.SerializerMethodField()
+
+    # Make remarks optional
+    remarks = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = BadgeAllocation
+        fields = [
+            "id",
+            "ticket_type",
+            "ticket_name",
+            "ticket_code",
+            "allocated_count",
+            "used_count",
+            "available_count",
+            "remarks",
+        ]
+
+    def get_used_count(self, obj):
+        return Registration.objects.filter(
+            exhibitor=obj.exhibitor,
+            ticket_type=obj.ticket_type,
+        ).exclude(status="cancelled").count()
+
+    def get_available_count(self, obj):
+        return obj.allocated_count - self.get_used_count(obj)
+
+
+
+class BadgeAllocationSerializer(serializers.Serializer):
+    exhibitor_id = serializers.IntegerField()
+    ticket_type_id = serializers.IntegerField()
+    allocated_count = serializers.IntegerField()
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_allocated_count(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Allocated count must be greater than 0")
+        return value
 
 
 
@@ -336,83 +449,55 @@ class TicketTypeCreateSerializer(serializers.Serializer):
 
 
 
-class TicketTypeUpdateSerializer(serializers.Serializer):
+class TicketTypeUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TicketType
+        fields = ["ticket_name", "ticket_code", "total_tickets", "status", "description"]
+ 
+    def validate_total_tickets(self, value):
+        if self.instance:
+            total_allocated = (
+                BadgeAllocation.objects.filter(ticket_type=self.instance)
+                .aggregate(total=Sum("allocated_count"))["total"] or 0
+            )
+            if value < total_allocated:
+                raise serializers.ValidationError(
+                    f"Cannot reduce total tickets to {value}. "
+                    f"{total_allocated} badge(s) are already allocated to exhibitors. "
+                    f"You can only set a value of {total_allocated} or higher."
+                )
+        return value
 
-    ticket_name = serializers.CharField(
-        required=False
-    )
 
-    total_tickets = serializers.IntegerField(
-        min_value=1,
-        required=False
-    )
-
-    description = serializers.CharField(
-        required=False,
-        allow_blank=True,  # ✅ ADD THIS — matches TicketTypeCreateSerializer
-        allow_null=True    # ✅ ADD THIS — model allows null=True, so be consistent
-    )
-
-    status = serializers.ChoiceField(
-        choices=[
-            "active",
-            "inactive"
-        ],
-        required=False
-    )
-    
 class TicketTypeListSerializer(serializers.ModelSerializer):
-
-    used_count = serializers.SerializerMethodField()
-    available_count = serializers.SerializerMethodField()
+    total_allocated   = serializers.SerializerMethodField()
+    total_used        = serializers.SerializerMethodField()
+    unallocated_count = serializers.SerializerMethodField()
 
     class Meta:
         model = TicketType
-        fields = (
-            "id",
-            "ticket_name",
-            "ticket_code",
-            "total_tickets",
-            "used_count",
-            "available_count",
-            "status",
+        fields = [
+            "id", "ticket_name", "ticket_code", "total_tickets", "status",
+            "description",
+            "total_allocated",
+            "total_used",
+            "unallocated_count",
+        ]
+
+    def get_total_allocated(self, obj):
+        return (
+            BadgeAllocation.objects.filter(ticket_type=obj)
+            .aggregate(total=Sum("allocated_count"))["total"] or 0
         )
 
-    def get_used_count(self, obj):
+    def get_total_used(self, obj):
         return Registration.objects.filter(
             ticket_type=obj
-        ).exclude(
-            status="cancelled"
-        ).count()
+        ).exclude(status="cancelled").count()
 
-    def get_available_count(self, obj):
-        used = self.get_used_count(obj)
-        return obj.total_tickets - used
+    def get_unallocated_count(self, obj):
+        return max(0, obj.total_tickets - self.get_total_allocated(obj))
         
-class BadgeAllocationSerializer(serializers.Serializer):
-
-    exhibitor_id = serializers.IntegerField()
-
-    ticket_type_id = serializers.IntegerField()
-
-    allocated_count = serializers.IntegerField()
-
-    remarks = serializers.CharField(
-        required=False
-    )
-
-    def validate_allocated_count(
-        self,
-        value
-    ):
-
-        if value <= 0:
-
-            raise serializers.ValidationError(
-                "Allocated count must be greater than 0"
-            )
-
-        return value
 
 
 class ExhibitorCreateSerializer(serializers.Serializer):

@@ -20,6 +20,8 @@ import pandas as pd
 from .tasks import process_bulk_upload
 from django.db.models import F
 from .tasks import process_bulk_upload, commit_bulk_upload
+from .utils import verify_recaptcha
+from .utils import get_exhibitor_allocation
 
 from .models import (
     TicketType,
@@ -57,6 +59,7 @@ from .serializers import (
     UploadBatchListSerializer,
     UploadBatchRecordSerializer,
     RecordEditSerializer,
+    BadgeAllocationListSerializer
 
 )
 
@@ -82,6 +85,133 @@ class BulkUploadPagination(
 
 
 
+
+
+class ExhibitorMyAllocationsAPIView(ListAPIView):
+    """
+    GET /exhibitor/my-allocations/
+    Returns the calling exhibitor's BadgeAllocation rows with usage info.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    serializer_class = BadgeAllocationListSerializer   # already defined in your codebase
+ 
+    def get_queryset(self):
+        exhibitor = self.request.user.exhibitor_profile
+        return BadgeAllocation.objects.filter(
+            exhibitor=exhibitor
+        ).select_related("ticket_type")
+
+
+
+class AdminExhibitorAllocationsAPIView(ListAPIView):
+    """
+    GET /admin/exhibitors/<exhibitor_id>/allocations/
+    Returns all BadgeAllocation rows for the given exhibitor,
+    augmented with per-ticket-type global pool info for the allocation panel.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = BadgeAllocationListSerializer
+ 
+    def get_queryset(self):
+        return BadgeAllocation.objects.filter(
+            exhibitor_id=self.kwargs["exhibitor_id"]
+        ).select_related("ticket_type")
+
+
+
+class CreateOrUpdateBadgeAllocationAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = BadgeAllocationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        exhibitor = get_object_or_404(Exhibitor, id=data["exhibitor_id"])
+        ticket_type = get_object_or_404(
+            TicketType.objects.select_for_update(), id=data["ticket_type_id"]
+        )
+
+        # ✅ Don't let admin hand out more than the global pool has left
+        already_allocated_elsewhere = BadgeAllocation.objects.filter(
+            ticket_type=ticket_type
+        ).exclude(exhibitor=exhibitor).aggregate(
+            total=Sum("allocated_count")
+        )["total"] or 0
+
+        if already_allocated_elsewhere + data["allocated_count"] > ticket_type.total_tickets:
+            remaining = ticket_type.total_tickets - already_allocated_elsewhere
+            return Response(
+                {
+                    "status": False,
+                    "message": (
+                        f"Cannot allocate {data['allocated_count']} '{ticket_type.ticket_name}' badges. "
+                        f"Only {remaining} remain unallocated out of {ticket_type.total_tickets} total "
+                        f"({already_allocated_elsewhere} already allocated to other exhibitors)."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allocation, created = BadgeAllocation.objects.select_for_update().get_or_create(
+            exhibitor=exhibitor,
+            ticket_type=ticket_type,
+            defaults={
+                "allocated_count": data["allocated_count"],
+                "allocated_by": request.user,
+                "remarks": data.get("remarks", ""),
+            }
+        )
+
+        if not created:
+            used = Registration.objects.filter(
+                exhibitor=exhibitor, ticket_type=ticket_type
+            ).exclude(status="cancelled").count()
+
+            if data["allocated_count"] < used:
+                return Response(
+                    {
+                        "status": False,
+                        "message": (
+                            f"Cannot reduce allocation to {data['allocated_count']}. "
+                            f"{used} badge(s) are already in use against it."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            allocation.allocated_count = data["allocated_count"]
+            allocation.allocated_by = request.user
+            allocation.remarks = data.get("remarks", allocation.remarks)
+            allocation.save()
+
+        return Response(
+            {
+                "status": True,
+                "message": "Badge allocation saved successfully",
+                "allocation": {
+                    "id": allocation.id,
+                    "exhibitor": exhibitor.company_name,
+                    "ticket_type": ticket_type.ticket_name,
+                    "allocated_count": allocation.allocated_count,
+                }
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ExhibitorBadgeAllocationListAPIView(ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BadgeAllocationListSerializer
+
+    def get_queryset(self):
+        return BadgeAllocation.objects.filter(
+            exhibitor_id=self.kwargs["exhibitor_id"]
+        ).select_related("ticket_type")
+
+
 # ─────────────────────────────────────────────
 # INVITATION VIEWS
 # Add these to your existing views.py
@@ -92,6 +222,7 @@ class BulkUploadPagination(
 class SendInvitationAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request):
         exhibitor = get_exhibitor(request)
         entries = request.data.get("entries", [])
@@ -105,13 +236,23 @@ class SendInvitationAPIView(APIView):
         created = []
         errors = []
 
+        # ✅ NEW — running per-ticket-type usage for THIS exhibitor, so
+        # multiple entries for the same ticket type in one request can't
+        # blow past the allocation before any row is even committed.
+        allocation_state = {}
+
+        def get_state(ticket_type_obj):
+            if ticket_type_obj.id not in allocation_state:
+                allocated, used, _ = get_exhibitor_allocation(exhibitor, ticket_type_obj)
+                allocation_state[ticket_type_obj.id] = {"allocated": allocated, "used": used}
+            return allocation_state[ticket_type_obj.id]
+
         for idx, entry in enumerate(entries):
             first_name = entry.get("first_name", "").strip()
             last_name = entry.get("last_name", "").strip()
             email = entry.get("email", "").strip()
             ticket_type_id = entry.get("ticket_type_id")
 
-            # ── Field Validation ─────────────────────────────
             row_errors = []
 
             if not first_name:
@@ -134,7 +275,6 @@ class SendInvitationAPIView(APIView):
                 })
                 continue
 
-            # ── Duplicate Email Check ───────────────────────
             if Registration.objects.filter(email=email).exists():
                 errors.append({
                     "row": idx + 1,
@@ -143,10 +283,8 @@ class SendInvitationAPIView(APIView):
                 })
                 continue
 
-            # ── Ticket Validation ───────────────────────────
             try:
                 ticket = TicketType.objects.get(id=ticket_type_id)
-
             except TicketType.DoesNotExist:
                 errors.append({
                     "row": idx + 1,
@@ -155,7 +293,23 @@ class SendInvitationAPIView(APIView):
                 })
                 continue
 
-            # ── Check Ticket Availability ───────────────────
+            # ── Check Exhibitor's Own Allocation ────────────  ✅ NEW
+            state = get_state(ticket)
+            exhibitor_available = state["allocated"] - state["used"]
+
+            if state["allocated"] == 0 or exhibitor_available <= 0:
+                errors.append({
+                    "row": idx + 1,
+                    "email": email,
+                    "errors": [
+                        f"You have only {max(exhibitor_available, 0)} '{ticket.ticket_name}' "
+                        f"badge(s) remaining out of your allocated {state['allocated']}. "
+                        "Please contact the administrator to increase your quota."
+                    ],
+                })
+                continue
+
+            # ── Check Global Ticket Availability ────────────
             used_count = Registration.objects.filter(
                 ticket_type=ticket
             ).exclude(
@@ -176,7 +330,6 @@ class SendInvitationAPIView(APIView):
                 })
                 continue
 
-            # ── Create Invitation Registration ──────────────
             try:
                 with transaction.atomic():
 
@@ -194,6 +347,8 @@ class SendInvitationAPIView(APIView):
                         registration=reg,
                         status="sent",
                     )
+
+                    state["used"] += 1  # ✅ NEW — reflect this entry for subsequent rows
 
                     created.append({
                         "id": reg.id,
@@ -691,20 +846,17 @@ class BulkUploadReviewView(APIView):
 # ─────────────────────────────────────────────
 class BulkUploadRecordEditView(APIView):
     permission_classes = [IsAuthenticated]
- 
+
     @transaction.atomic
     def patch(self, request, record_id):
-        # select_for_update() + select_related() causes Django to emit
-        # FOR UPDATE on the nullable side of an outer join — SQLite doesn't
-        # allow this. Fix: lock the bare row first, then re-fetch with joins.
         get_object_or_404(UploadBatchRecord.objects.select_for_update(), id=record_id)
         record = get_object_or_404(
             UploadBatchRecord.objects.select_related("batch__exhibitor", "ticket_type"),
             id=record_id,
         )
- 
+
         old_status = record.validation_status
- 
+
         serializer = RecordEditSerializer(record, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -712,10 +864,9 @@ class BulkUploadRecordEditView(APIView):
             "first_name", "last_name", "email",
             "ticket_type_id", "validation_status", "error_message",
         ])
- 
+
         errors = []
- 
-        # Check 1: required fields
+
         if not record.first_name:
             errors.append("First name is required.")
         if not record.last_name:
@@ -724,8 +875,7 @@ class BulkUploadRecordEditView(APIView):
             errors.append("Email is required.")
         if not record.ticket_type_id:
             errors.append("Ticket type is required.")
- 
-        # Check 2: duplicate within this batch (among other valid records)
+
         duplicate_in_batch = (
             UploadBatchRecord.objects.filter(
                 batch=record.batch,
@@ -735,37 +885,34 @@ class BulkUploadRecordEditView(APIView):
             .exclude(id=record.id)
             .exists()
         )
- 
-        # Check 3: duplicate against already-committed registrations for this exhibitor
+
         duplicate_committed = Registration.objects.filter(
             exhibitor=record.batch.exhibitor,
             email=record.email,
         ).exists()
- 
+
         if duplicate_in_batch or duplicate_committed:
             errors.append("Duplicate email found.")
- 
-        # Check 4: quota — use TicketType.total_tickets minus confirmed registrations.
-        # Same source as process_bulk_upload and commit_bulk_upload tasks.
+
+        # Check 4: global pool — unchanged
+        batch_usage = 0
         if not errors and record.ticket_type_id:
-            ticket_type_obj = record.ticket_type  # already loaded via select_related
+            ticket_type_obj = record.ticket_type
             total_allowed = ticket_type_obj.total_tickets
- 
-            # Globally confirmed registrations for this ticket type
+
             confirmed_count = Registration.objects.filter(
                 ticket_type_id=record.ticket_type_id,
                 status="confirmed",
             ).count()
- 
-            # Other valid records in this batch already consuming this ticket type
+
             batch_usage = UploadBatchRecord.objects.filter(
                 batch=record.batch,
                 ticket_type_id=record.ticket_type_id,
                 validation_status="valid",
             ).exclude(id=record.id).count()
- 
+
             total_used = confirmed_count + batch_usage
- 
+
             if total_used >= total_allowed:
                 errors.append(
                     f"Badge quota exceeded for '{ticket_type_obj.ticket_name}' "
@@ -773,14 +920,30 @@ class BulkUploadRecordEditView(APIView):
                     "Please contact your admin to allocate more badges "
                     "or choose a different ticket type."
                 )
- 
+
+            # ✅ NEW — Check 5: this exhibitor's own allocation
+            if not errors:
+                exhibitor = record.batch.exhibitor
+                allocated, exhibitor_confirmed, _ = get_exhibitor_allocation(
+                    exhibitor, ticket_type_obj
+                )
+                exhibitor_used = exhibitor_confirmed + batch_usage
+                exhibitor_available = allocated - exhibitor_used
+
+                if allocated == 0 or exhibitor_available <= 0:
+                    errors.append(
+                        f"You have only {max(exhibitor_available, 0)} '{ticket_type_obj.ticket_name}' "
+                        f"badge(s) remaining out of your allocated {allocated}. "
+                        "Please contact the administrator to increase your quota."
+                    )
+
         is_valid = len(errors) == 0
         new_status = "valid" if is_valid else "invalid"
- 
+
         record.validation_status = new_status
         record.error_message = None if is_valid else " | ".join(errors)
         record.save(update_fields=["validation_status", "error_message"])
- 
+
         if old_status != new_status:
             if old_status == "invalid" and new_status == "valid":
                 UploadBatch.objects.filter(id=record.batch_id).update(
@@ -792,9 +955,9 @@ class BulkUploadRecordEditView(APIView):
                     valid_records=F("valid_records") - 1,
                     invalid_records=F("invalid_records") + 1,
                 )
- 
+
         record.batch.refresh_from_db(fields=["valid_records", "invalid_records"])
- 
+
         return Response(
             {
                 "message": "Record updated successfully",
@@ -802,8 +965,7 @@ class BulkUploadRecordEditView(APIView):
                 "batch_valid_records": record.batch.valid_records,
                 "batch_invalid_records": record.batch.invalid_records,
             }
-        )
- 
+        ) 
  
 # ─────────────────────────────────────────────
 # STEP 5 — Commit valid records to Registration
@@ -1018,27 +1180,43 @@ class RegistrationCreateAPIView(CreateAPIView):
     serializer_class = RegistrationCreateSerializer
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def perform_create(self, serializer):
-
         exhibitor = self.request.user.exhibitor_profile
         ticket_type = serializer.validated_data["ticket_type"]
 
-        used_count = Registration.objects.filter(
-            ticket_type=ticket_type
-        ).exclude(
-            status="cancelled"
-        ).count()
-
-        available_count = (
-            ticket_type.total_tickets - used_count
+        allocated, exhibitor_used, exhibitor_available = get_exhibitor_allocation(
+            exhibitor, ticket_type
         )
 
-        if available_count <= 0:
+        if allocated == 0:
             raise ValidationError(
                 {
-                    "ticket_type":
-                    f"No available badges left for '{ticket_type.ticket_name}'."
+                    "ticket_type": (
+                        f"You have not been allocated any '{ticket_type.ticket_name}' "
+                        "badges. Please contact the administrator."
+                    )
                 }
+            )
+
+        if exhibitor_available <= 0:
+            raise ValidationError(
+                {
+                    "ticket_type": (
+                        f"You have only {exhibitor_available} '{ticket_type.ticket_name}' "
+                        f"badge(s) remaining out of your allocated {allocated}. "
+                        "Please contact the administrator to increase your quota."
+                    )
+                }
+            )
+
+        used_count = Registration.objects.filter(
+            ticket_type=ticket_type
+        ).exclude(status="cancelled").count()
+
+        if ticket_type.total_tickets - used_count <= 0:
+            raise ValidationError(
+                {"ticket_type": f"No available badges left for '{ticket_type.ticket_name}'."}
             )
 
         serializer.save(
@@ -1046,7 +1224,7 @@ class RegistrationCreateAPIView(CreateAPIView):
             status="confirmed",
             registered_via="single_badge",
         )
-
+        
 class RegistrationUpdateAPIView(UpdateAPIView):
 
     authentication_classes = [JWTAuthentication]
@@ -1055,13 +1233,67 @@ class RegistrationUpdateAPIView(UpdateAPIView):
     serializer_class = RegistrationUpdateSerializer
 
     def get_queryset(self):
-
         exhibitor = self.request.user.exhibitor_profile
+        return Registration.objects.filter(exhibitor=exhibitor)
 
-        return Registration.objects.filter(
-            exhibitor=exhibitor
+    def perform_update(self, serializer):
+        registration = serializer.instance  # already-fetched instance, no extra query
+        new_ticket_type = serializer.validated_data.get(
+            "ticket_type", registration.ticket_type
         )
 
+        # ✅ NEW — only re-check quota when the ticket type is actually changing.
+        # If unchanged, this registration already holds its seat.
+        if new_ticket_type != registration.ticket_type:
+            exhibitor = registration.exhibitor
+
+            allocated, exhibitor_used, exhibitor_available = get_exhibitor_allocation(
+                exhibitor, new_ticket_type
+            )
+
+            if allocated == 0:
+                raise ValidationError(
+                    {
+                        "ticket_type": (
+                            f"You have not been allocated any '{new_ticket_type.ticket_name}' "
+                            "badges. Please contact the administrator."
+                        )
+                    }
+                )
+
+            if exhibitor_available <= 0:
+                raise ValidationError(
+                    {
+                        "ticket_type": (
+                            f"You have only {exhibitor_available} '{new_ticket_type.ticket_name}' "
+                            f"badge(s) remaining out of your allocated {allocated}. "
+                            "Please contact the administrator to increase your quota."
+                        )
+                    }
+                )
+
+            # Global pool check — exclude this registration's own row since
+            # it's about to move INTO this type, not currently counted against it.
+            used_count = Registration.objects.filter(
+                ticket_type=new_ticket_type
+            ).exclude(
+                status="cancelled"
+            ).exclude(
+                id=registration.id
+            ).count()
+
+            available_count = new_ticket_type.total_tickets - used_count
+
+            if available_count <= 0:
+                raise ValidationError(
+                    {
+                        "ticket_type": (
+                            f"No available badges left for '{new_ticket_type.ticket_name}'."
+                        )
+                    }
+                )
+
+        serializer.save()
 
 
 class RegistrationDeleteAPIView(DestroyAPIView):
@@ -1194,6 +1426,17 @@ class ExhibitorLoginAPIView(APIView):
     permission_classes = []
 
     def post(self, request):
+
+        # ✅ Verify captcha before touching credentials at all
+        captcha_token = request.data.get("captcha_token")
+        if not verify_recaptcha(captcha_token):
+            return Response(
+                {
+                    "status": False,
+                    "message": "Captcha verification failed. Please try again."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         serializer = (ExhibitorLoginSerializer(data=request.data))
 
@@ -1412,22 +1655,15 @@ class DeleteExhibitorAPIView(APIView):
             }
         }, status=status.HTTP_200_OK)
 
-        
+
 class TicketTypeListAPIView(ListAPIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = TicketTypeListSerializer
 
     def get_queryset(self):
-        return TicketType.objects.filter(status="active")
+        return TicketType.objects.all()
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-
-        if hasattr(self.request.user, "exhibitor_profile"):
-            context["exhibitor"] = self.request.user.exhibitor_profile
-
-        return context
 
 
 class CreateTicketTypeAPIView(APIView):
@@ -1516,6 +1752,17 @@ class SuperAdminLoginView(APIView):
 
     def post(self, request):
 
+        # ✅ Verify captcha before touching credentials at all
+        captcha_token = request.data.get("captcha_token")
+        if not verify_recaptcha(captcha_token):
+            return Response(
+                {
+                    "status": False,
+                    "message": "Captcha verification failed. Please try again."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         serializer = LoginSerializer(data=request.data)
 
         if not serializer.is_valid():
@@ -1541,7 +1788,6 @@ class SuperAdminLoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
-        # ✅ ADD THIS — block exhibitors from accessing the admin panel
         if not user.is_superuser and getattr(user, "role", None) == "exhibitor":
             return Response(
                 {

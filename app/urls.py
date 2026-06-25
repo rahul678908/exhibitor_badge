@@ -3,7 +3,13 @@ from . views import *
 
 urlpatterns = [
 
+    # Create or update badge allocation view
+    path("admin/badge-allocations/", CreateOrUpdateBadgeAllocationAPIView.as_view(), name="create-update-badge-allocation"),
 
+    # Badge Allocation List API View
+    path("admin/exhibitors/<int:exhibitor_id>/badge-allocations/", ExhibitorBadgeAllocationListAPIView.as_view(), name="exhibitor-badge-allocations"),
+
+    path("exhibitor/my-allocations/", ExhibitorMyAllocationsAPIView.as_view(), name="exhibitor-my-allocations"),
 
     # ── Send Invitations ─────────────────────────────────────────────────
     path("exhibitor/invitations/send/", SendInvitationAPIView.as_view(), name="invitation_send"),

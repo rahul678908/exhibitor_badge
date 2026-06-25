@@ -14,8 +14,16 @@ from pathlib import Path
 
 from datetime import timedelta
 
+import environ
+import os
+
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+env = environ.Env()
+environ.Env.read_env(os.path.join(BASE_DIR, ".env"))
 
 
 # Quick-start development settings - unsuitable for production
@@ -23,6 +31,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-anf0u920q^o&$q1v&d9@a*jq1rv1d%n5=80p*t1r68baaxb^ej'
+
+# RECAPTCHA SECRET KEY
+RECAPTCHA_SECRET_KEY = env("RECAPTCHA_SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -147,6 +158,7 @@ REST_FRAMEWORK = {
 # CORS settings
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
+    "https://exhibitor-badge-frontend.vercel.app",
 ]
 
 # For development purposes, you can allow all origins. In production, it's recommended to specify allowed origins.
@@ -177,4 +189,5 @@ CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 
 # settings.py — add this anywhere, bottom is fine
-FRONTEND_URL = "https://exhibitor-badge-frontend.vercel.app/"
+FRONTEND_URL = " https://exhibitor-badge-frontend.vercel.app"
+

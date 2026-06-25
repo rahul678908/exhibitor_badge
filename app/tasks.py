@@ -7,6 +7,7 @@ from django.core.cache import cache
 from django.db import transaction
 
 from .models import (
+    BadgeAllocation,   # ✅ NEW
     Exhibitor,
     Registration,
     TicketType,
@@ -64,11 +65,11 @@ def _build_errors(row):
     msgs = []
     if row["err_no_first"]:
         msgs.append("First name is required.")
-    if row["err_digit_first"]:                          # ← ADD
+    if row["err_digit_first"]:
         msgs.append("First name must not contain numbers.")
     if row["err_no_last"]:
         msgs.append("Last name is required.")
-    if row["err_digit_last"]:                           # ← ADD
+    if row["err_digit_last"]:
         msgs.append("Last name must not contain numbers.")
     if row["err_no_email"]:
         msgs.append("Email is required.")
@@ -82,6 +83,11 @@ def _build_errors(row):
         msgs.append("Ticket type is required or not recognized.")
     if row["err_quota_exceeded"]:
         msgs.append("Requested records exceed available ticket balance.")
+    if row["err_exhibitor_quota_exceeded"]:   # ✅ NEW
+        msgs.append(
+            "Exceeds your allocated badge quota for this ticket type. "
+            "Please contact the administrator to increase your quota."
+        )
     return " | ".join(msgs)
 
 # ─────────────────────────────────────────────────────────────
@@ -127,8 +133,7 @@ def process_bulk_upload(self, batch_id, mappings):
         batch_emails = set(df["email_lower"]) - {""}
         existing_emails = _fetch_existing_emails_chunked(batch_emails)
 
-        # Quota map: TicketType.total_tickets minus already-confirmed registrations.
-        # This is a global pool — same source used by the commit task and edit view.
+        # Global pool: TicketType.total_tickets minus already-confirmed registrations.
         quota_map = {
             t.id: t.total_tickets - Registration.objects.filter(
                 ticket_type=t, status="confirmed"
@@ -136,14 +141,36 @@ def process_bulk_upload(self, batch_id, mappings):
             for t in TicketType.objects.filter(status="active")
         }
 
+        # ✅ NEW — exhibitor's own allocation per ticket type
+        exhibitor = batch.exhibitor
+
+        allocation_map = {
+            a.ticket_type_id: a.allocated_count
+            for a in BadgeAllocation.objects.filter(exhibitor=exhibitor)
+        }
+
+        # ✅ NEW — exhibitor's existing usage per ticket type, excluding cancelled.
+        # Matches get_exhibitor_allocation() semantics used elsewhere — NOT
+        # BadgeAllocation.used_count, which only counts "confirmed".
+        exhibitor_used_counts = {}
+        for tid in Registration.objects.filter(
+            exhibitor=exhibitor
+        ).exclude(status="cancelled").values_list("ticket_type_id", flat=True):
+            exhibitor_used_counts[tid] = exhibitor_used_counts.get(tid, 0) + 1
+
+        exhibitor_quota_map = {
+            tid: allocation_map[tid] - exhibitor_used_counts.get(tid, 0)
+            for tid in allocation_map
+        }
+        # A ticket_type_id absent here means this exhibitor has no BadgeAllocation
+        # row for it at all — every row using it is invalid for that reason.
+
         # ── 3. Vectorized validation ───────────────────────────────────
         df["ticket_type_id_val"] = df["ticket_type"].str.lower().map(ticket_type_map)
         df["is_batch_duplicate"] = (
             df["email_lower"].duplicated(keep="first") & (df["email_lower"] != "")
         )
 
-        # BUG FIX 1: assign all err_* columns to df HERE, before the quota loop,
-        # so that row["err_no_first"] etc. are accessible inside the loop.
         df["err_no_first"]     = df["first_name"].eq("")
         df["err_no_last"]      = df["last_name"].eq("")
         df["err_no_email"]     = df["email"].eq("")
@@ -158,20 +185,23 @@ def process_bulk_upload(self, batch_id, mappings):
         df["err_no_ticket"]    = df["ticket_type_id_val"].isna()
 
         # ── 4. Per-row quota check (must be sequential) ─────────────────
-        #       Scenario: 9 TradePass available, 10 uploaded → rows 1-9 valid,
-        #       row 10 gets err_quota_exceeded=True.
-        #       Rows already invalid for OTHER reasons do not consume quota.
-        remaining_quota = dict(quota_map)   # mutable copy
-        err_quota_exceeded_list = []
+        # A row only consumes a seat from EITHER pool if it passes BOTH
+        # checks — a row invalid for either reason never actually takes a seat.
+        remaining_quota = dict(quota_map)
+        remaining_exhibitor_quota = dict(exhibitor_quota_map)   # ✅ NEW
 
+        err_quota_exceeded_list = []
+        err_exhibitor_quota_exceeded_list = []   # ✅ NEW
+
+        # ✅ FIXED — if no allocation row exists, fall back to global pool only
         for _, row in df.iterrows():
             tid = row["ticket_type_id_val"]
 
             already_invalid = (
                 row["err_no_first"]     or
                 row["err_no_last"]      or
-                row["err_digit_first"]  or   # ← ADD
-                row["err_digit_last"]   or   # ← ADD
+                row["err_digit_first"]  or
+                row["err_digit_last"]   or
                 row["err_no_email"]     or
                 row["err_bad_email"]    or
                 row["err_email_exists"] or
@@ -181,33 +211,42 @@ def process_bulk_upload(self, batch_id, mappings):
 
             if already_invalid or pd.isna(tid):
                 err_quota_exceeded_list.append(False)
+                err_exhibitor_quota_exceeded_list.append(False)
                 continue
 
             tid = int(tid)
 
-            if tid not in remaining_quota or remaining_quota[tid] <= 0:
-                err_quota_exceeded_list.append(True)
-            else:
-                remaining_quota[tid] -= 1   # consume one slot
-                err_quota_exceeded_list.append(False)
+            global_ok = tid in remaining_quota and remaining_quota[tid] > 0
 
-        # BUG FIX 2: the original code discarded err_quota_exceeded_list and
-        # re-assigned df["err_quota_exceeded"] using `blocked_ticket_ids`
-        # which was never defined → NameError crash. Use the list we built above.
+            # ✅ If no allocation row exists for this exhibitor+ticket, skip
+            # the exhibitor quota check and rely on global pool only
+            has_allocation = tid in remaining_exhibitor_quota
+            exhibitor_ok = (not has_allocation) or (remaining_exhibitor_quota[tid] > 0)
+
+            err_quota_exceeded_list.append(not global_ok)
+            err_exhibitor_quota_exceeded_list.append(has_allocation and not exhibitor_ok)
+
+            if global_ok and exhibitor_ok:
+                remaining_quota[tid] -= 1
+                if has_allocation:
+                    remaining_exhibitor_quota[tid] -= 1
+
         df["err_quota_exceeded"] = err_quota_exceeded_list
+        df["err_exhibitor_quota_exceeded"] = err_exhibitor_quota_exceeded_list
 
         # ── 5. Final valid/invalid determination ───────────────────────
         any_error = (
             df["err_no_first"]      |
             df["err_no_last"]       |
-            df["err_digit_first"]   |   # ← ADD
-            df["err_digit_last"]    |   # ← ADD
+            df["err_digit_first"]   |
+            df["err_digit_last"]    |
             df["err_no_email"]      |
             df["err_bad_email"]     |
             df["err_email_exists"]  |
             df["err_duplicate"]     |
             df["err_no_ticket"]     |
-            df["err_quota_exceeded"]
+            df["err_quota_exceeded"]           |
+            df["err_exhibitor_quota_exceeded"]    # ✅ NEW
         )
 
         df["validation_status"] = np.where(any_error, "invalid", "valid")
@@ -280,7 +319,6 @@ def process_bulk_upload(self, batch_id, mappings):
         UploadBatch.objects.filter(id=batch_id).update(status="failed")
         raise self.retry(exc=exc, countdown=10)
 
-
 # ─────────────────────────────────────────────────────────────
 # Task 2 — commit valid records to Registration
 # ─────────────────────────────────────────────────────────────
@@ -319,8 +357,7 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
         to_insert = [r for r in valid_records if r.email.lower() not in already_exists]
 
         # ── 3. Re-check quota at commit time (race-condition guard) ─────
-        # Use same source as process_bulk_upload: TicketType.total_tickets
-        # minus already-confirmed registrations.
+        # Global pool — same source as process_bulk_upload.
         quota_remaining = {}
         for t in TicketType.objects.filter(status="active"):
             confirmed = Registration.objects.filter(
@@ -328,23 +365,52 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
             ).count()
             quota_remaining[t.id] = t.total_tickets - confirmed
 
+        # ✅ NEW — this exhibitor's own allocation, re-checked fresh too
+        allocation_map = {
+            a.ticket_type_id: a.allocated_count
+            for a in BadgeAllocation.objects.filter(exhibitor=exhibitor)
+        }
+        exhibitor_used_counts = {}
+        for tid in Registration.objects.filter(
+            exhibitor=exhibitor
+        ).exclude(status="cancelled").values_list("ticket_type_id", flat=True):
+            exhibitor_used_counts[tid] = exhibitor_used_counts.get(tid, 0) + 1
+
+        exhibitor_remaining = {
+            tid: allocation_map[tid] - exhibitor_used_counts.get(tid, 0)
+            for tid in allocation_map
+        }
+
         quota_approved = []
         quota_rejected = []
 
         for record in to_insert:
             tid = record.ticket_type_id
-            if tid not in quota_remaining or quota_remaining[tid] <= 0:
-                quota_rejected.append(record)
-            else:
+
+            global_ok = tid in quota_remaining and quota_remaining[tid] > 0
+
+            # ✅ Same fallback — no allocation row = rely on global pool only
+            has_allocation = tid in exhibitor_remaining
+            exhibitor_ok = (not has_allocation) or (exhibitor_remaining[tid] > 0)
+
+            if global_ok and exhibitor_ok:
                 quota_remaining[tid] -= 1
+                if has_allocation:
+                    exhibitor_remaining[tid] -= 1
                 quota_approved.append(record)
+            else:
+                quota_rejected.append(record)
 
         if quota_rejected:
             UploadBatchRecord.objects.filter(
                 id__in=[r.id for r in quota_rejected]
             ).update(
                 validation_status="invalid",
-                error_message="Requested records exceed available ticket balance. Please contact your admin to allocate more badges or choose a different ticket type.",
+                error_message=(
+                    "Requested records exceed the available ticket balance or your "
+                    "allocated badge quota. Please contact your admin to allocate "
+                    "more badges or choose a different ticket type."
+                ),
             )
 
         to_insert = quota_approved
@@ -359,12 +425,6 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
             }
 
         # ── 4. Bulk insert ─────────────────────────────────────────────
-        # NOTE: bulk_create()'s returned objects only have .id populated
-        # when the backend supports RETURNING on multi-row inserts. On
-        # SQLite (depending on the sqlite3 lib version) this silently
-        # comes back as None, so we can't trust r.id here. Instead we
-        # look the rows back up by the unique temp urn we just assigned —
-        # that works identically on every backend.
         created_ids = []
         with transaction.atomic():
             buffer = []
@@ -421,6 +481,7 @@ def commit_bulk_upload(self, batch_id, exhibitor_id):
         return {
             "inserted": len(created_ids),
             "skipped_duplicates": len(skipped),
+            "quota_rejected": len(quota_rejected),   # ✅ NEW — surface this too
         }
 
     except Exception as exc:
