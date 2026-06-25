@@ -1310,12 +1310,31 @@ class DeleteTicketTypeAPIView(APIView):
 
     def delete(self, request, pk):
         ticket = get_object_or_404(TicketType, id=pk)
+
+        # ✅ Block deactivation if any active registrations exist
+        active_count = Registration.objects.filter(
+            ticket_type=ticket
+        ).exclude(
+            status="cancelled"
+        ).count()
+
+        if active_count > 0:
+            return Response(
+                {
+                    "error": (
+                        f"Cannot deactivate '{ticket.ticket_name}'. "
+                        f"{active_count} badge(s) are already registered against this ticket."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         ticket.status = "inactive"
         ticket.save()
 
         return Response(
             {"message": "Ticket deactivated"},
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
 
 
@@ -1328,6 +1347,26 @@ class UpdateTicketTypeAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         data = serializer.validated_data
+
+        # ✅ Block reducing total_tickets below already-used count
+        if "total_tickets" in data:
+            used_count = Registration.objects.filter(
+                ticket_type=ticket
+            ).exclude(
+                status="cancelled"
+            ).count()
+
+            if data["total_tickets"] < used_count:
+                return Response(
+                    {
+                        "error": (
+                            f"Cannot reduce total tickets to {data['total_tickets']}. "
+                            f"{used_count} badges are already registered against this ticket."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         for field, value in data.items():
             setattr(ticket, field, value)
         ticket.save()
@@ -1344,9 +1383,36 @@ class UpdateTicketTypeAPIView(APIView):
                     "status": ticket.status,
                 }
             },
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
 
+
+class DeleteExhibitorAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def delete(self, request, pk):
+        exhibitor = get_object_or_404(Exhibitor, id=pk)
+
+        registration_count = Registration.objects.filter(exhibitor=exhibitor).count()
+        badge_count = Registration.objects.filter(exhibitor=exhibitor).exclude(status="cancelled").count()
+        invitation_count = Invitation.objects.filter(registration__exhibitor=exhibitor).count()
+
+        user = exhibitor.user
+        exhibitor.delete()
+        user.delete()
+
+        return Response({
+            "status": True,
+            "message": "Exhibitor deleted successfully.",
+            "removed": {
+                "registrations": registration_count,
+                "active_badges": badge_count,
+                "invitations": invitation_count,
+            }
+        }, status=status.HTTP_200_OK)
+
+        
 class TicketTypeListAPIView(ListAPIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -1475,15 +1541,23 @@ class SuperAdminLoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
+        # ✅ ADD THIS — block exhibitors from accessing the admin panel
+        if not user.is_superuser and getattr(user, "role", None) == "exhibitor":
+            return Response(
+                {
+                    "status": False,
+                    "message": "You don't have the permission to access this side"
+                },
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
         refresh = RefreshToken.for_user(user)
 
         return Response({
             "status": True,
             "message": "Login Successful",
-
             "access_token": str(refresh.access_token),
             "refresh_token": str(refresh),
-
             "user": {
                 "id": user.id,
                 "username": user.username,

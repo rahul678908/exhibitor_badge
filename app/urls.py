@@ -93,6 +93,9 @@ urlpatterns = [
     # ────────────────────────────── Exhibitor Details ──────────────────────────────────────
     path("admin/exhibitors/<int:pk>/", ExhibitorDetailAPIView.as_view(), name='exhibitor_detail'),
 
+    # Exhibitor Delete
+    path("admin/exhibitors/<int:pk>/delete/", DeleteExhibitorAPIView.as_view(), name='delete_exhibitor'),
+
     # ────────────────────────────── Update Exhibitor ──────────────────────────────────────
     path("admin/tickets/create/", CreateTicketTypeAPIView.as_view(), name='create_ticket_type'),
 
