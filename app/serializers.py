@@ -348,7 +348,9 @@ class TicketTypeUpdateSerializer(serializers.Serializer):
     )
 
     description = serializers.CharField(
-        required=False
+        required=False,
+        allow_blank=True,  # ✅ ADD THIS — matches TicketTypeCreateSerializer
+        allow_null=True    # ✅ ADD THIS — model allows null=True, so be consistent
     )
 
     status = serializers.ChoiceField(
@@ -358,7 +360,7 @@ class TicketTypeUpdateSerializer(serializers.Serializer):
         ],
         required=False
     )
-
+    
 class TicketTypeListSerializer(serializers.ModelSerializer):
 
     used_count = serializers.SerializerMethodField()

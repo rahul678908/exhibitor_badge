@@ -177,4 +177,4 @@ CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 
 # settings.py — add this anywhere, bottom is fine
-FRONTEND_URL = "http://localhost:5173"
+FRONTEND_URL = "https://exhibitor-badge-frontend.vercel.app/"
